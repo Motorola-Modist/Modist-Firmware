@@ -1,0 +1,346 @@
+#! /usr/bin/env python
+
+#
+# Copyright (c) 2015 Google Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from this
+# software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+from __future__ import print_function
+import os
+import sys
+import argparse
+import shlex
+from util import error, print_to_error
+import subprocess
+
+# Program return values
+PROGRAM_SUCCESS = 0
+PROGRAM_WARNINGS = 1
+PROGRAM_ERRORS = 2
+
+OFFSET_HELP = """The offset from the start of the file
+It may be specified as any of:
+    num
+    num+num
+    symbol
+    symbol+num
+
+(All numbers are in hex, 'symbol' requires --map)"""
+PATCH_HELP = \
+    """Patch <offset> [and | or | xor | rep(lace)] <byte>... {verify <byte>...}
+The offset from the start of the file
+It may be specified as any of:
+    num
+    num+num
+    symbol
+    symbol+num
+(All numbers are in hex)"""
+
+
+class open_rw_file_pair():
+    def __init__(self, file1, file2):
+        self.fn1 = file1
+        self.fn2 = file2
+
+    def __enter__(self):
+        self.f1 = open(self.fn1, 'r')
+        self.f2 = open(self.fn2, 'w')
+        return (self.f1, self.f2)
+
+    def __exit__(self, type, value, traceback):
+        self.f1.close()
+        self.f2.close()
+
+
+def auto_int(x):
+    # Workaround to allow hex numbers to be entered for numeric arguments
+    return int(x, 16)
+
+
+def have_patching_args(test_args):
+    """Determine from the test args if the bin file will be patched
+
+    Returns True if the file will be patched, False otherwise.
+    """
+    # Normally we will be patching the Flash image. However, some tests,
+    # like the e-Fuse test set use stock images with different e-Fuse
+    #preloads.
+    if test_args.patch:
+        return True
+    else:
+        return False
+
+
+def validate_test_args(test_args, patch_file):
+    """Sanity-check the test args and return an error string
+
+    Returns None if the args are valid, or a string if invalid.
+    """
+    # Check that they have specified test pass/fail criteria
+    if not test_args.pass_str and not test_args.fail_str:
+        return "you must have a pass or a fail string"
+
+    # Check that they haven't specified both pass and fail strings
+    if test_args.pass_str and test_args.fail_str:
+        return "you can't mix pass and fail strings"
+
+    # The line is valid
+    return None
+
+
+def write_test_term(f_test, tag, value):
+    # write a single "tag value" pair to the test file, quoting as needed
+    if (value.find(" ") != -1) or (value.find("\t") != -1):
+        f_test.write("{0:s} \"{1:s}\" ".format(tag, value))
+    else:
+        f_test.write("{0:s} {1:s} ".format(tag, value))
+
+
+def process_1_desc(test_args, patch_file, f_test, test_path, bin_pathname,
+                   flash_pathname, map_pathname):
+    """Process a single test descriptor
+
+    From the parsed test_args, it will generate a 1-line entry in the test
+    file. It also copies the bootrom bin file and the Flash image file to
+    the test folder. If "patch_file" is true, it copies the flash file to
+    the test folder with a test-specific name (Flash.bin =>
+    Flash-TestName>.bin) to which it applies the patches specified in the
+    test_args.
+
+    test_args
+        The test arguments parsed by process_desc_file for one test
+    patch_file
+        Indicates if the flash file is copied or copied and modified
+    f_test
+        The file descriptor of the test suite file.
+    test_path
+        The path to the test folder to generate and populate with the test
+        suite
+    bin_pathanme
+        The pathname of the bootrom image
+    flash_pathname
+        The pathname of the default flash image file
+    map_pathname
+        The pathname of the .map file (used to patch the flash image).
+        (This may be None if no patches are applied)
+    """
+    # Create a test-specific version of the bootrom .bin file
+    tail = os.path.basename(bin_pathname)
+    test_bin_pathname = os.path.join(test_path, tail)
+
+    # Create a test-specific version of the flash image file
+    (head, tail) = os.path.split(flash_pathname)
+    (root, ext) = os.path.splitext(tail)
+    if patch_file:
+        testname = root + "-" + test_args.testname + ext
+        test_flash_pathname = os.path.join(test_path, testname)
+    else:
+        test_flash_pathname = os.path.join(test_path, tail)
+
+    # Copy the test bin file
+    subprocess.check_call(["cp", bin_pathname, test_bin_pathname])
+
+    # Copy and optionally patch the test flash file
+    subprocess.check_call(["cp", flash_pathname, test_flash_pathname])
+    if patch_file:
+        cmdline = ["hexpatch", "--file", flash_pathname,
+                   "--out", test_flash_pathname]
+        for patch in test_args.patch:
+            cmdline.append("--patch")
+            for field in patch:
+                cmdline.append(field)
+        if map_pathname:
+            cmdline += ["--map",  map_pathname]
+        subprocess.check_call(cmdline)
+
+    # Generate the test file entry
+    write_test_term(f_test, "-t", test_args.testname)
+    if test_args.description:
+        write_test_term(f_test, "-d", test_args.description)
+    write_test_term(f_test, "-b", test_bin_pathname)
+    if test_args.efuse:
+        write_test_term(f_test, "-e", test_args.efuse)
+    if test_args.response:
+        write_test_term(f_test, "-r", test_args.response)
+    if test_args.pass_str:
+        for str in test_args.pass_str:
+            write_test_term(f_test, "-p", str)
+    else:
+        for str in test_args.fail_str:
+            write_test_term(f_test, "-f", str)
+    f_test.write("\n")
+
+
+def process_desc_file(desc_pathname, flash_pathname, map_pathname,
+                      bin_pathname, test_path, test_file):
+    """Process the test descriptor file
+
+    Processes the test descriptor file, generating an output .test file
+    in the folder referenced by test_path, and a set of modified
+    BootRom.bin files.
+
+    desc_pathname
+        The pathname to the test suite descriptor file to parse
+    flash_pathname
+        The pathname of the default flash image file
+    map_pathname
+        The pathname of the .map file (used to patch the flash image).
+        (This may be None if no patches are applied by any of the tests)
+    bin_pathanme
+        The pathname of the bootrom image
+    test_path
+        The path to the test folder to generate and populate with the test
+        suite
+    test_file
+        The name of the test suite file proper
+    """
+    # Set up the test descriptor parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--testname", "-t",
+                        required=True,
+                        help="The test name")
+
+    parser.add_argument("--description", "-d",
+                        help="The test description")
+
+    parser.add_argument("--response", "-r",
+                        help="Test response file")
+
+    parser.add_argument("--patch",
+                        action="append",
+                        nargs='*',
+                        help=PATCH_HELP)
+
+    parser.add_argument("--pass_str", "-p",
+                        action="append",
+                        help="passing string")
+
+    parser.add_argument("--fail_str", "-f",
+                        action="append",
+                        help="failing string")
+
+    parser.add_argument("--efuse", "-e",
+                        help="The pathname of the e-Fuse file"
+                        "(overrides default e-Fuse file)")
+
+    # Create the test folder if needed
+    if not os.path.isdir(test_path):
+        os.makedirs(test_path)
+    test_pathname = os.path.join(test_path, test_file)
+
+    # Extract the name of the test descriptor file
+    script = os.path.basename(desc_pathname)
+
+    # Now parse and process each line in the test suite descriptor file
+    with open_rw_file_pair(desc_pathname, test_pathname) as (f_desc, f_test):
+        line_num = 1
+        parse_line = ""
+        for line in f_desc:
+            # Handle continuation lines
+            line = line.rstrip()
+            if (len(line) >=1) and (line[-1] == "\\"):
+                parse_line += line[0:-1]
+                # Note that, while we keep the line number correct, parsing
+                # errors will be displaced to the last line number of a
+                # continued line.
+                line_num += 1
+                continue
+            else:
+                parse_line += line
+
+            # Chop each line into a list, stripping comments and
+            # preserving quoted strings
+            test_descriptor = shlex.split(parse_line, True)
+            if test_descriptor:
+                parser.prog = "{0:s} (line {1:d})".format(script, line_num)
+                test_args = parser.parse_args(test_descriptor)
+                patch_file = have_patching_args(test_args) and map_pathname
+                error_string = validate_test_args(test_args, patch_file)
+                if error_string:
+                    error("(line {0:d}) {1:s}:".format(line_num, error_string))
+                    print_to_error(parse_line)
+                else:
+                    try:
+                        process_1_desc(test_args, patch_file, f_test,
+                                       test_path, bin_pathname,
+                                       flash_pathname, map_pathname)
+                    except:
+                        print_to_error("Error on line", line_num, "of",
+                                       os.path.basename(desc_pathname))
+            line_num += 1
+            parse_line = ""
+
+
+def main():
+    """Generate a test file and set of altered BootRom.bin files"""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--desc", "-d",
+                        required=True,
+                        help="The file containing the test descriptors")
+
+    parser.add_argument("--test", "-t",
+                        required=True,
+                        help="The output .test file")
+
+    parser.add_argument("--out_folder", "-o",
+                        default="./",
+                        help="The output folder for the test file and "
+                             "altered .bins")
+
+    parser.add_argument("--bin", "-b",
+                        required=True,
+                        help="The BootRom.bin pathname from which "
+                             "altered copies are made")
+
+    parser.add_argument("--flash", "-f",
+                        required=True,
+                        help="The flash image to (modify and) load")
+
+    args = parser.parse_args()
+
+    # Locate the flash image's map file. This is passed down to "hexpatch",
+    # which opens/uses it. This is simply a pre-check to avoid doing a lot
+    # of fruitless work. If the file should be deleted between this test and
+    # it being used by hexpatch, hexpatch will handle it.
+    (root, ext) = os.path.splitext(args.flash)
+    map_pathname = root + ".map"
+    if not os.path.isfile(map_pathname):
+        error("No map file found with", args.flash)
+        sys.exit(PROGRAM_ERRORS)
+
+    try:
+        process_desc_file(args.desc, args.flash, map_pathname, args.bin,
+                          args.out_folder, args.test)
+    except:
+        error("Unable to generate test file suite")
+        raise
+
+
+## Launch main
+#
+if __name__ == '__main__':
+    main()

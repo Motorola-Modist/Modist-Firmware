@@ -1,0 +1,160 @@
+#! /usr/bin/env python
+
+#
+# Copyright (c) 2015 Google Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from this
+# software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+## Tool to automatically download an image into the HAPS board and boot it
+#
+
+from __future__ import print_function
+import sys
+import argparse
+import common_args
+from efuse import efuses, parse_efuse
+from util import error
+from haps_boot import download_and_boot_haps, download_and_boot_haps_capture,\
+    RESET_MANUAL, RESET_FT232H
+
+# Program return values
+PROGRAM_SUCCESS = 0
+PROGRAM_WARNINGS = 1
+PROGRAM_ERRORS = 2
+
+# HAPS character timeout (1 second wait on characters, in 0.1 sec units)
+HAPS_CHAR_TIMEOUT = 10
+
+# HAPS boot timeout (~30 sec in character timeout counts)
+HAPS_BOOT_TIMEOUT_COUNT = 300
+
+JLINK_RESET_SCRIPT = "cmd-jlink-start-1"  # "cmd-jlink-start-1"
+JLINK_POST_RESET_SCRIPT = "cmd-jlink-start-2"  # "cmd-jlink-start-2"
+
+# Reset mechanism
+RESET_MECHANISMS = {
+    "manual": RESET_MANUAL,
+    "adafruit": RESET_FT232H}
+
+
+def normalize_tty_name(tty_name):
+    # Try to normalize lazy tty names
+    #
+    # Returns the normalized name
+    normalized_tty_name = tty_name
+    if tty_name.find("tty") == 0:
+        # convert "ttyXXX" to "/dev/ttyXXX"
+        normalized_tty_name = "/dev/" + tty_name
+    if tty_name.find("dev") == 0:
+        # convert "dev/ttyXXX" to "/dev/ttyXXX"
+        normalized_tty_name = "/" + tty_name
+    if normalized_tty_name.find("/dev/tty") != 0:
+        # so much for trying to "be nice" - give up
+        raise ValueError("Unknown tty: '{0:s}'".format(tty_name))
+    return normalized_tty_name
+
+
+def main():
+    """Mainline"""
+
+    parser = argparse.ArgumentParser()
+
+    # Common args:
+    for args, kwargs in common_args.AUTOBOOT_COMMON_ARGUMENTS:
+        parser.add_argument(*args, **kwargs)
+
+    # Capture-specific args:
+    parser.add_argument("--bin",
+                        required=True,
+                        help="The name of the bootrom file to download")
+
+    #parser.add_argument("--capture",
+    #                    help="Capture the debug spew from the "
+    #                         "daughterboard debug serial tty")
+
+    parser.add_argument("--out",
+                        help="The file to which the debug spew is written")
+
+    parser.add_argument("--stop",
+                        action="append",
+                        help="A 'stop recording' string for which to monitor")
+
+    parser.add_argument("--timeout",
+                        type=int,
+                        default=5,
+                        help="Debug serial timeout, in seconds")
+
+    args = parser.parse_args()
+
+    # Override the eFuses with the supplied file
+    if args.efuse:
+        parse_efuse(args.efuse)
+
+    # Determine the reset mechanism (default will be "manual")
+    if args.reset in RESET_MECHANISMS:
+        reset_mechanism = RESET_MECHANISMS[args.reset]
+    elif not args.reset:
+        reset_mechanism = RESET_MANUAL
+    else:
+        error("Unknown reset mechanism:", args.reset)
+        sys.exit(PROGRAM_ERRORS)
+
+    # Download and boot the HAPS board with the supplied image, optionally
+    # capturing the debug spew
+    if args.capture:
+        try:
+            args.chipit = normalize_tty_name(args.chipit)
+            args.capture = normalize_tty_name(args.capture)
+            capture = download_and_boot_haps_capture(args.chipit, args.scripts,
+                                                     args.jlinksn,
+                                                     reset_mechanism, args.bin,
+                                                     efuses, args.capture,
+                                                     args.timeout, None, None,
+                                                     args.stop)
+        except (ValueError):
+            error("Unable to contact HAPS board")
+            sys.exit(PROGRAM_ERRORS)
+
+        if args.out:
+            with open(args.out, "w") as fdw:
+                print("\n".join(capture), file=fdw)
+        else:
+            print("\n".join(capture))
+    else:
+        try:
+            args.chipit = normalize_tty_name(args.chipit)
+            download_and_boot_haps(args.chipit, args.scripts, args.jlinksn,
+                                   reset_mechanism, args.bin, efuses)
+        except (ValueError):
+            error("Unable to contact HAPS board")
+            sys.exit(PROGRAM_ERRORS)
+    sys.exit(PROGRAM_SUCCESS)
+
+
+## Launch main
+#
+if __name__ == '__main__':
+    main()

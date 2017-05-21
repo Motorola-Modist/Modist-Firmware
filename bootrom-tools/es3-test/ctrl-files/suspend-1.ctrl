@@ -1,0 +1,29 @@
+# Test Controller setup for standby/resume
+#
+Initial Conditions:
+  SPIBOOT_N:		1	# Indicates UniPro should be used
+  e-Fuse preload:	Yes	# Load from the E-fuse data file
+  VDDSDIO:		1.8v	# No STIO interface power at startup
+  Boot Bridge:		Yes	# Release Boot Bridge from reset at atartup
+  Server Release:	Yes	# Release Serever (other) Bridge from reset at atartup
+  MPHY Connection:	2-lane	# No UniPro link active
+
+Operations:
+  Clear BootRet_o
+  De-assert GPIO3,4,5,23
+  Power ON Server Bridge
+  Release RESET on Server Bridge
+  Wait the UniPro link up
+  Power ON Boot Bridge
+  Release RESET for Boot Bridge
+  Bridge Handshake
+  wait until PWROFF_N == 0
+  wait 2ms
+  Set BootRet_o
+  assert GPIO_3
+  wait 40us
+  deassert GPIO_3
+  Bridge Handshake
+  Simulation Finish
+
+
